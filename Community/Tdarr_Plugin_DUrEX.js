@@ -1,5 +1,3 @@
-/* eslint-disable */
-
 const details = () => {
   return {
     id: "Tdarr_Plugin_DUrEX",
@@ -7,8 +5,8 @@ const details = () => {
     Name: "Davo's Ultimate reEcoder eXtended", 
     Type: "Video",
     Operation: "Transcode",
-    Description: "One of if not the only plugin that will reencode HEVC to HEVC. So for example from really high bitrate bluray to quality suitable for a TV show. Will reecode video based on tiers and can optionally downscale 4k to 1080p. If target rate percentage is lower than tier will scale to that. Reencodes HEVC files but target percentage is always 1. Will remove audio and subtitles that are not in the configured language or marked as commentary. If there are multiple audio streams you can use priority options to specify your preferred stream to keep. E.g. truehd>dts>ac3. You can optionally reencode audio with bitrate per channel and desired codec and number of channels. Default is still to copy the audio though. eXtended from the original plugin to now use hw or cpu encoding and determine what to use with specific parameters for each GPU.  Finally, now will detect if previously encoded by metadata Davoprocessed=true and if so won't attempt again. This negates the need to rename the file in the flow and check for name.",
-    Version: "2.0",
+    Description: "One of if not the only plugin that will reencode HEVC to HEVC. Will reecode video based on tiers and can optionally downscale 4k to 1080p. If target rate percentage is lower than tier will scale to that. Reencodes HEVC files but target percentage is always 1. Will removes audio and subtitles that are not in the configured language or marked as commentary. v6 now will give priority options if there are multiple audio tracks. E.g. truehd>dts>ac3. v7 now allows optional reencoding of audio with bitrate per channel and desired codec and number of channels. Default is still to copy the audio though. eXtended from the original to now use hw or cpu encoding and determine what to use with specific parameters for each GPU - v3 enhanced to enable user prioritisation.  Finally, now will detect if previously encoded by metadata Davoprocessed=true and if so won't attempt again. This negates the need to rename the file in the flow and check for name.",
+    Version: "3.1.0",
     Tags: "pre-processing,ffmpeg,nvenc h265,qsv h265,configurable,audio only,subtitle only",
     Inputs: [
       {
@@ -587,59 +585,83 @@ function buildAudioConfiguration(inputs, file, jobReport) {
 
 
 function buildSubtitleConfiguration(inputs, file, jobReport) {
+  jobReport.steps.push("Starting subtitle configuration...");
   jobReport.steps.push("Within Subtitle function");
-
-  const filePath = file._id || file.file;
-
-  if (!filePath) {
-    jobReport.steps.push("Warning: file path is undefined. Inspecting file object:");
-    jobReport.steps.push(`File object: ${JSON.stringify(file, null, 2)}`);
-  } else {
-    jobReport.steps.push(`File name: ${filePath}`);
-  }
-
-  if (filePath && filePath.toLowerCase().endsWith(".ts")) {
-    jobReport.steps.push("File is of type .ts, disabling subtitles with '-sn' flag.");
-    return new Configurator(["-sn"]);
-  }
-
+  
   const configuration = new Configurator(["-c:s copy"]);
-  const languages = inputs.subtitle_language.split(",");
-
-  function subtitleProcess(stream, id) {
+  const languages = inputs.subtitle_language.toLowerCase().split(",").map(lang => lang.trim());
+  
+  jobReport.steps.push(`subtitle languages to keep: ${languages}`);
+  
+  // Early return if no languages specified
+  if (languages.length === 0) {
+    jobReport.steps.push("No subtitle languages specified. Skipping processing.");
+    return configuration;
+  }
+  
+  loopOverStreamsOfType(file, "subtitle", function(stream, id) {
+	let streamLanguage = "unknown";
+	if ("tags" in stream && "language" in stream.tags) {
+	  streamLanguage = stream.tags.language.toLowerCase();
+	}
+    jobReport.steps.push(`Processing subtitle stream ${id} (found language ${streamLanguage})`);  
     jobReport.steps.push(`Full stream data: ${JSON.stringify(stream, null, 2)}`);
-
-    const codec = stream.codec_name || "unknown";
-    jobReport.steps.push(`Detected subtitle stream: ID=${id}, Codec=${codec}`);
-
-    if (codec === "unknown" || codec === "none") {
-      jobReport.steps.push(`Skipping problematic subtitle track (stream id: ${id})`);
+    
+    // Check for unsupported subtitle codecs
+    if ((stream.codec_name === "eia_608") || (stream.codec_tag_string === "mp4s")) {
+      jobReport.steps.push(`Removing unsupported subtitle codec: ${stream.codec_name}`);
       configuration.AddOutputSetting(`-map -0:s:${id}`);
       return;
     }
-
-    if ("tags" in stream && "language" in stream.tags) {
-      const language = stream.tags.language.toLowerCase();
-      if (languages.includes(language)) {
-        jobReport.steps.push(`Retaining subtitle track in language ${language} (stream id: ${id})`);
-        configuration.AddOutputSetting(`-map 0:${id}`);
-      } else {
-        jobReport.steps.push(`Removing subtitle track in language ${language} (stream id: ${id})`);
+    
+    // Remove unknown subtitle streams
+    if (!("codec_name" in stream)) {
+      jobReport.steps.push(`Removing unknown subtitle stream`);
+      configuration.AddOutputSetting(`-map -0:s:${id}`);
+      return;
+    }
+    
+    // Process streams with tags
+    if ("tags" in stream) {
+      let language = null;
+      
+      // Try to get language from tags
+      if ("language" in stream.tags) {
+        language = stream.tags.language.toLowerCase();
+        
+        // Check language
+        if (languages.indexOf(language) === -1) {
+          jobReport.steps.push(`Removing subtitle stream ${id} in language ${language}`);
+          configuration.AddOutputSetting(`-map -0:s:${id}`);
+          return;
+        }
+      }
+      
+      // Check for commentary subtitles
+      if ("title" in stream.tags && (inputs.subtitle_commentary.toLowerCase() === "true")) {
+        const title = stream.tags.title.toLowerCase();
+        if (
+          title.includes("commentary") ||
+          title.includes("description") ||
+          title.includes("sdh")
+        ) {
+          jobReport.steps.push(`Removing Commentary or Description subtitle: ${stream.tags.title}`);
+          configuration.AddOutputSetting(`-map -0:s:${id}`);
+          return;
+        }
       }
     }
+    
+    jobReport.steps.push(`Keeping subtitle stream ${id}`);
+  }, jobReport);
+  
+  // Ensure settings exist and are an array
+  if (!configuration.settings || !Array.isArray(configuration.settings)) {
+    configuration.settings = ["-c:s copy"];
   }
-
-  loopOverStreamsOfType(file, "subtitle", subtitleProcess, jobReport);
-
-  // Safely log the final configuration settings
-  const finalSettings = Array.isArray(configuration.settings) 
-    ? configuration.settings.join(' ') 
-    : 'No settings available';
-  jobReport.steps.push(`Final subtitle settings: ${finalSettings}`);
-
+  
   return configuration;
 }
-
 
 
 function buildVideoConfiguration(inputs, file, jobReport, encoder) {
@@ -763,10 +785,8 @@ function buildVideoConfiguration(inputs, file, jobReport, encoder) {
 
 const hasEncoder = async (encoder, ffmpegPath, jobReport) => {
     const { exec } = require('child_process');
-    
     return new Promise((resolve) => {
         const command = `${ffmpegPath} -f lavfi -i color=c=black:s=256x256:d=1:r=30 -c:v ${encoder} -f null /dev/null`;
-        
         exec(command, (error) => {
             if (jobReport) {
                 jobReport.steps.push(`Checking encoder ${encoder}: ${error ? 'Not Available' : 'Available'}`);
@@ -776,57 +796,50 @@ const hasEncoder = async (encoder, ffmpegPath, jobReport) => {
     });
 };
 
-const getBestHevcEncoder = async (otherArguments, jobReport) => {
+const getBestHevcEncoder = async (otherArguments, priorities, jobReport) => {
     const ffmpegPath = otherArguments.ffmpegPath;
+
+    // List of HEVC encoders and default priorities
     const hevcEncoders = [
-        {
-            name: 'hevc_nvenc',
-            type: 'gpu'
-        },
-        {
-            name: 'hevc_amf',
-            type: 'gpu'
-        },
-        {
-            name: 'hevc_vaapi',
-            type: 'gpu'
-        },
-        {
-            name: 'hevc_qsv',
-            type: 'gpu'
-        },
-        {
-            name: 'hevc_videotoolbox',
-            type: 'gpu'
-        },
-        {
-            name: 'libx265',
-            type: 'cpu'
-        }
+        { name: 'hevc_nvenc', type: 'gpu' },
+        { name: 'hevc_amf', type: 'gpu' },
+        { name: 'hevc_vaapi', type: 'gpu' },
+        { name: 'hevc_qsv', type: 'gpu' },
+        { name: 'hevc_videotoolbox', type: 'gpu' },
+        { name: 'libx265', type: 'cpu' }
     ];
 
-    if (jobReport) {
-        jobReport.steps.push("Detecting available HEVC encoders:");
-    }
+    jobReport.steps.push("Detecting available HEVC encoders and resolving priorities:");
     
-    for (const encoder of hevcEncoders) {
-        if (jobReport) {
-            jobReport.steps.push(`Checking encoder: ${encoder.name}`);
-        }
+
+    // Assign priorities to encoders based on provided `priorities`
+    const prioritizedEncoders = hevcEncoders.map((encoder) => ({
+        ...encoder,
+        priority: priorities[encoder.name] !== undefined ? priorities[encoder.name] : Number.MAX_SAFE_INTEGER // Set a high default priority if not specified
+    }));
+
+    // Sort encoders by ascending priority values
+    prioritizedEncoders.sort((a, b) => a.priority - b.priority);
+	
+	jobReport.steps.push("HEVC Encoder Priorities (Lower number = Higher priority):");
+	prioritizedEncoders.forEach(encoder => {
+		jobReport.steps.push(`  Encoder: ${encoder.name}, Priority: ${encoder.priority}`);
+	});
+
+    // Check availability of encoders based on sorted priority
+    for (const encoder of prioritizedEncoders) {
+        jobReport.steps.push(`Checking encoder: ${encoder.name} (Priority: ${encoder.priority})`);
         
         const isAvailable = await hasEncoder(encoder.name, ffmpegPath, jobReport);
-        
         if (isAvailable) {
-            if (jobReport) {
-                jobReport.steps.push(`Encoder ${encoder.name} is available`);
-            }
+            jobReport.steps.push(`Encoder ${encoder.name} is available and selected`);
+            
             return encoder;
         }
     }
 
-    if (jobReport) {
-        jobReport.steps.push("No HEVC encoders found");
-    }
+    jobReport.steps.push("No HEVC encoders found");
+    
     return null;
 };
 
@@ -845,11 +858,20 @@ const plugin = async (file, librarySettings, inputs, otherArguments) => {
         preset: "",
         reQueueAfter: true,
     };
+	
+	const priorities = {
+		hevc_nvenc: 3,   // Lowest number - highest priority
+		libx265: 1,      // don't duplicate numbers
+		hevc_qsv: 2,     // numbers 1 - 6
+		hevc_vaapi: 6,
+		hevc_amf: 5,
+		hevc_videotoolbox: 4
+	};
 
     // Initialize jobReport at the start of the function
     const jobReport = {
         type: "plugin",
-        pluginName: "DUrE - Davo's Ultimate ReEncoder eXtended",
+        pluginName: "DUrEx 3.0.1 - Davo's Ultimate ReEncoder eXtended",
         steps: [],
     };
 
@@ -870,9 +892,9 @@ const plugin = async (file, librarySettings, inputs, otherArguments) => {
 
 		// Check for processed metadata with multiple variations
 		const processedMetadataKeys = [
-			'DAVOPROCESSED', 
-			'davoprocessed', 
-			'DavoProcessed'
+			'DAVOPROCESSEDx', 
+			'davoprocessedx', 
+			'DavoProcessedx'
 		];
 
 		// Debug logging
@@ -909,7 +931,7 @@ const plugin = async (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Pass jobReport to the encoder detection function
-        const encoder = await getBestHevcEncoder(otherArguments, jobReport);
+		const encoder = await getBestHevcEncoder(otherArguments, priorities, jobReport);	
         if (!encoder) {
             jobReport.steps.push("No HEVC encoders found");
             return {
