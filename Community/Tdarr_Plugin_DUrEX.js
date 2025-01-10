@@ -892,9 +892,9 @@ const plugin = async (file, librarySettings, inputs, otherArguments) => {
 
 		// Check for processed metadata with multiple variations
 		const processedMetadataKeys = [
-			'DAVOPROCESSEDx', 
-			'davoprocessedx', 
-			'DavoProcessedx'
+			'DAVOPROCESSED', 
+			'davoprocessed', 
+			'DavoProcessed'
 		];
 
 		// Debug logging
